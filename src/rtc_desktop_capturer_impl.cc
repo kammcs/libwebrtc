@@ -69,10 +69,10 @@ bool CanCaptureWithoutBorder() {
   }
 
   ComPtr<WF::Metadata::IApiInformationStatics> api_info;
-  if (FAILED(webrtc::GetActivationFactory<
-             WF::Metadata::IApiInformationStatics,
-             RuntimeClass_Windows_Foundation_Metadata_ApiInformation>(
-          &api_info))) {
+  HRESULT hr = webrtc::GetActivationFactory<
+      WF::Metadata::IApiInformationStatics,
+      RuntimeClass_Windows_Foundation_Metadata_ApiInformation>(&api_info);
+  if (FAILED(hr)) {
     return false;
   }
   static const wchar_t kSessionType[] =
@@ -101,10 +101,10 @@ bool CanCaptureWithoutBorder() {
   }
 
   ComPtr<WGC::IGraphicsCaptureAccessStatics> access;
-  if (FAILED(webrtc::GetActivationFactory<
-             WGC::IGraphicsCaptureAccessStatics,
-             RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureAccess>(
-          &access))) {
+  hr = webrtc::GetActivationFactory<
+      WGC::IGraphicsCaptureAccessStatics,
+      RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureAccess>(&access);
+  if (FAILED(hr)) {
     return false;
   }
   ComPtr<WF::IAsyncOperation<Access::AppCapabilityAccessStatus>> request;
