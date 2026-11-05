@@ -502,6 +502,12 @@ void RTCPeerConnectionImpl::SetLocalDescription(const string sdp,
   std::optional<webrtc::SdpType> maybe_type =
       webrtc::SdpTypeFromString(to_std_string(type));
   if (!maybe_type) {
+    // Answer the caller: an unknown type used to leave it waiting forever.
+    std::string message =
+        "RTCPeerConnectionImpl::SetLocalDescription:: Unknown session "
+        "description type: " + to_std_string(type);
+    RTC_LOG(LS_WARNING) << message;
+    failure(message.c_str());
     return;
   }
   std::unique_ptr<webrtc::SessionDescriptionInterface> session_description(
@@ -534,6 +540,12 @@ void RTCPeerConnectionImpl::SetRemoteDescription(const string sdp,
   std::optional<webrtc::SdpType> maybe_type =
       webrtc::SdpTypeFromString(type.std_string());
   if (!maybe_type) {
+    // Answer the caller: an unknown type used to leave it waiting forever.
+    std::string message =
+        "RTCPeerConnectionImpl::SetRemoteDescription:: Unknown session "
+        "description type: " + type.std_string();
+    RTC_LOG(LS_WARNING) << message;
+    failure(message.c_str());
     return;
   }
   std::unique_ptr<webrtc::SessionDescriptionInterface> session_description(
@@ -549,14 +561,16 @@ void RTCPeerConnectionImpl::SetRemoteDescription(const string sdp,
     return;
   }
 
-  webrtc::MediaContentDescription* content_desc =
-      session_description->description()->GetContentDescriptionByName("video");
-  webrtc::MediaContentDescription* media_content_desc =
-      (webrtc::MediaContentDescription*)content_desc;
-
-  if (media_content_desc && configuration_.local_video_bandwidth > 0)
-    media_content_desc->set_bandwidth(configuration_.local_video_bandwidth *
-                                      1000);
+  // A rollback ({type: "rollback"}, no SDP) has no description to adjust:
+  // description() is null for it, and reading it crashed.
+  if (session_description->description()) {
+    webrtc::MediaContentDescription* media_content_desc =
+        session_description->description()->GetContentDescriptionByName(
+            "video");
+    if (media_content_desc && configuration_.local_video_bandwidth > 0)
+      media_content_desc->set_bandwidth(configuration_.local_video_bandwidth *
+                                        1000);
+  }
   webrtc::scoped_refptr<webrtc::SetRemoteDescriptionObserverInterface>
       observer = webrtc::make_ref_counted<SetSessionDescriptionObserverProxy>(
           success, failure);
