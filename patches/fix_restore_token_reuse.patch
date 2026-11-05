@@ -1,0 +1,23 @@
+--- a/modules/desktop_capture/linux/wayland/restore_token_manager.cc
++++ b/modules/desktop_capture/linux/wayland/restore_token_manager.cc
+@@ -26,13 +26,17 @@
+ void RestoreTokenManager::AddToken(DesktopCapturer::SourceId id,
+                                    const std::string& token) {
+   MutexLock lock(&mutex_);
+-  restore_tokens_.insert({id, token});
++  // A restore token is single use: the portal returns a new one with every
++  // restored session, which replaces the one stored for this source.
++  restore_tokens_.insert_or_assign(id, token);
+ }
+ 
+ std::string RestoreTokenManager::GetToken(DesktopCapturer::SourceId id) {
+   MutexLock lock(&mutex_);
+-  const std::string token = restore_tokens_[id];
+-  return token;
++  // Don't insert an empty token for an unknown id: it would block the
++  // AddToken() that follows a successful pick.
++  auto it = restore_tokens_.find(id);
++  return it == restore_tokens_.end() ? std::string() : it->second;
+ }
+ 
+ DesktopCapturer::SourceId RestoreTokenManager::GetUnusedId() {
