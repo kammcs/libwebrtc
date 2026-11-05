@@ -29,6 +29,16 @@ class RTCDesktopDeviceImpl : public RTCDesktopDevice {
       scoped_refptr<MediaSource> source,
       const RTCDesktopCapturerOptions& options) override;
 
+  bool HasSystemPicker() override;
+
+  scoped_refptr<RTCDesktopCapturer> CreateSystemPickerCapturer(
+      bool screens, bool windows, const string restore_id,
+      const RTCDesktopCapturerOptions& options) override;
+
+  scoped_refptr<RTCDesktopCapturer> CreatePipeWireStreamCapturer(
+      int pipewire_fd, uint32_t stream_node_id, const string session_handle,
+      const RTCDesktopCapturerOptions& options) override;
+
  private:
   webrtc::Thread* signaling_thread_ = nullptr;
   std::map<DesktopType, scoped_refptr<RTCDesktopMediaListImpl>>

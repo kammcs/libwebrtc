@@ -41,9 +41,14 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
 #ifdef WEBRTC_WIN
   options_.set_allow_directx_capturer(true);
 #endif
-#ifdef WEBRTC_LINUX
-  if (type == kScreen) {
-    options_.set_allow_pipewire(true);
+#if defined(WEBRTC_USE_PIPEWIRE)
+  options_.set_allow_pipewire(true);
+  // With the system picker (the ScreenCast portal), sources can't be listed:
+  // a capturer here would open a portal session of its own. The list holds
+  // one placeholder source instead (see UpdateSourceList()).
+  system_picker_ = RTCDesktopCapturerImpl::UsesSystemPicker();
+  if (system_picker_) {
+    return;
   }
 #endif
   callback_ = std::make_unique<CallbackProxy>();
@@ -52,6 +57,10 @@ RTCDesktopMediaListImpl::RTCDesktopMediaListImpl(DesktopType type,
       capturer_ = webrtc::DesktopCapturer::CreateScreenCapturer(options_);
     } else {
       capturer_ = webrtc::DesktopCapturer::CreateWindowCapturer(options_);
+    }
+    if (!capturer_) {
+      // Nothing to list on this system; the list stays empty.
+      return;
     }
     capturer_->Start(callback_.get());
   });
@@ -73,8 +82,20 @@ int32_t RTCDesktopMediaListImpl::UpdateSourceList(bool force_reload,
   }
 
   webrtc::DesktopCapturer::SourceList new_sources;
-  thread_->BlockingCall(
-      [this, &new_sources] { capturer_->GetSourceList(&new_sources); });
+  if (system_picker_) {
+    // The system picker chooses the actual source when the capture starts.
+    webrtc::DesktopCapturer::Source placeholder;
+    placeholder.id =
+        type_ == kScreen ? kSystemPickerScreenId : kSystemPickerWindowId;
+    placeholder.title = type_ == kScreen ? "Screen" : "Window";
+    new_sources.push_back(placeholder);
+  } else {
+    thread_->BlockingCall([this, &new_sources] {
+      if (capturer_) {
+        capturer_->GetSourceList(&new_sources);
+      }
+    });
+  }
 
   typedef std::set<webrtc::DesktopCapturer::SourceId> SourceSet;
   SourceSet new_source_set;
@@ -158,9 +179,13 @@ int32_t RTCDesktopMediaListImpl::UpdateSourceList(bool force_reload,
 
 bool RTCDesktopMediaListImpl::GetThumbnail(scoped_refptr<MediaSource> source,
                                            bool notify) {
+  if (system_picker_) {
+    // No thumbnails: nothing may be captured before the user picks.
+    return false;
+  }
   thread_->PostTask([this, source, notify] {
     MediaSourceImpl* source_impl = static_cast<MediaSourceImpl*>(source.get());
-    if (capturer_->SelectSource(source_impl->source_id())) {
+    if (capturer_ && capturer_->SelectSource(source_impl->source_id())) {
       callback_->SetCallback([&](webrtc::DesktopCapturer::Result result,
                                  std::unique_ptr<webrtc::DesktopFrame> frame) {
         auto old_thumbnail = source_impl->thumbnail();

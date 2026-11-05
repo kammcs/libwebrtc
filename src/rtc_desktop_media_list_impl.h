@@ -73,6 +73,10 @@ class RTCDesktopMediaListImpl : public RTCDesktopMediaList {
   enum CaptureState { CS_RUNNING, CS_STOPPED, CS_FAILED };
 
  public:
+  // The ids of the placeholder sources listed with the system picker.
+  static constexpr webrtc::DesktopCapturer::SourceId kSystemPickerScreenId = 0;
+  static constexpr webrtc::DesktopCapturer::SourceId kSystemPickerWindowId = 1;
+
   RTCDesktopMediaListImpl(DesktopType type, webrtc::Thread* signaling_thread);
 
   virtual ~RTCDesktopMediaListImpl();
@@ -125,6 +129,9 @@ class RTCDesktopMediaListImpl : public RTCDesktopMediaList {
   MediaListObserver* observer_ = nullptr;
   DesktopType type_;
   webrtc::Thread* signaling_thread_ = nullptr;
+  // Whether the system picker chooses sources (see
+  // RTCDesktopDevice::HasSystemPicker()).
+  bool system_picker_ = false;
 };
 
 }  // namespace libwebrtc

@@ -39,6 +39,16 @@
 #include "rtc_base/win/hstring.h"
 #endif
 #endif
+#if defined(WEBRTC_USE_PIPEWIRE)
+#include <glib.h>
+
+#include <chrono>
+#include <thread>
+
+#include "modules/desktop_capture/desktop_capturer_differ_wrapper.h"
+#include "modules/desktop_capture/linux/wayland/base_capturer_pipewire.h"
+#include "src/internal/pipewire_stream_portal.h"
+#endif
 
 namespace libwebrtc {
 
@@ -51,6 +61,29 @@ RTCDesktopCapturerOptions OptionsWithCursor(bool show_cursor) {
   options.show_cursor = show_cursor;
   return options;
 }
+
+#if defined(WEBRTC_USE_PIPEWIRE)
+// The source of a PipeWire capturer: its id is the key of the portal's
+// restore token, which RTCDesktopDevice::CreateSystemPickerCapturer() takes
+// back as restore_id. There's no name or thumbnail; the portal shows those.
+class PipeWireMediaSource : public MediaSource {
+ public:
+  PipeWireMediaSource(webrtc::DesktopCapturer::SourceId id, DesktopType type)
+      : id_(id), type_(type) {}
+
+  string id() const override { return string(std::to_string(id_)); }
+  string name() const override { return string(); }
+  portable::vector<unsigned char> thumbnail() const override {
+    return portable::vector<unsigned char>();
+  }
+  DesktopType type() const override { return type_; }
+  bool UpdateThumbnail() override { return false; }
+
+ private:
+  const webrtc::DesktopCapturer::SourceId id_;
+  const DesktopType type_;
+};
+#endif
 
 #if defined(WEBRTC_WIN) && defined(RTC_ENABLE_WIN_WGC)
 // Whether Windows lets this app capture without the WGC capture border: the
@@ -170,10 +203,10 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
   }
 #endif
 #endif
-#ifdef WEBRTC_LINUX
-  if (type == kScreen) {
-    options_.set_allow_pipewire(true);
-  }
+#if defined(WEBRTC_USE_PIPEWIRE)
+  // In a Wayland session, windows can be captured only through PipeWire as
+  // well: without it there's no window capturer at all.
+  options_.set_allow_pipewire(true);
 #endif
   const bool showCursor = options.show_cursor;
   const bool wants_borderless = !options.wgc_border_required;
@@ -203,22 +236,180 @@ RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
 #else
     (void)wants_borderless;
 #endif
-    if (type == kScreen) {
-      if (showCursor) {
-        capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
-            webrtc::DesktopCapturer::CreateScreenCapturer(options_), options_);
-      } else {
-        capturer_ = webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
-                webrtc::DesktopCapturer::CreateScreenCapturer(options_));
-      }
+    std::unique_ptr<webrtc::DesktopCapturer> capturer =
+        type == kScreen
+            ? webrtc::DesktopCapturer::CreateScreenCapturer(options_)
+            : webrtc::DesktopCapturer::CreateWindowCapturer(options_);
+    if (!capturer) {
+      // No capturer for this kind of source on this system; Start() fails.
+      RTC_LOG(LS_ERROR) << "RTCDesktopCapturerImpl: no "
+                        << (type == kScreen ? "screen" : "window")
+                        << " capturer on this system";
+      return;
+    }
+    if (type == kScreen && !showCursor) {
+      capturer_ =
+          webrtc::DesktopAndCursorComposer::CreateWithoutMouseCursorMonitor(
+              std::move(capturer));
     } else {
       capturer_ = std::make_unique<webrtc::DesktopAndCursorComposer>(
-          webrtc::DesktopCapturer::CreateWindowCapturer(options_), options_);
+          std::move(capturer), options_);
     }
   });
 }
 
+#if defined(WEBRTC_USE_PIPEWIRE)
+// static
+bool RTCDesktopCapturerImpl::UsesSystemPicker() {
+  return webrtc::BaseCapturerPipeWire::IsSupported();
+}
+
+RTCDesktopCapturerImpl::RTCDesktopCapturerImpl(
+    const PipeWireCaptureRequest& request, webrtc::Thread* signaling_thread,
+    const RTCDesktopCapturerOptions& options)
+    : thread_(webrtc::Thread::Create()),
+      source_id_(-1),
+      signaling_thread_(signaling_thread),
+      focus_window_(false) {
+  RTC_DCHECK(thread_);
+  type_ = request.picker_type == webrtc::CaptureType::kWindow ? kWindow
+                                                               : kScreen;
+  strided_frames_ = true;
+  if (!request.external_stream) {
+    picker_result_ = kPickerPending;
+  }
+  thread_->Start();
+  options_ = webrtc::DesktopCaptureOptions::CreateDefault();
+  options_.set_detect_updated_region(true);
+  options_.set_allow_pipewire(true);
+  // The portal draws the cursor into the frames ("embedded"), or sends it
+  // as metadata that isn't drawn.
+  options_.set_prefer_cursor_embedded(options.show_cursor);
+  const bool show_cursor = options.show_cursor;
+  thread_->BlockingCall([this, &request, show_cursor] {
+    // Everything the portal does on this capturer's behalf (GDBus replies
+    // and signals) is delivered to this thread through its own GLib main
+    // context, which CaptureFrame() iterates. The application's main loop,
+    // often the UI thread, is never involved and never waited on.
+    glib_context_ = g_main_context_new();
+    g_main_context_push_thread_default(glib_context_);
+    CreatePipeWireCapturer(request, show_cursor);
+  });
+}
+
+void RTCDesktopCapturerImpl::CreatePipeWireCapturer(
+    const PipeWireCaptureRequest& request, bool show_cursor) {
+  RTC_DCHECK_RUN_ON(thread_.get());
+  (void)show_cursor;
+  if (!webrtc::BaseCapturerPipeWire::IsSupported()) {
+    RTC_LOG(LS_ERROR) << "RTCDesktopCapturerImpl: PipeWire capture isn't "
+                         "available";
+    return;
+  }
+  std::unique_ptr<webrtc::BaseCapturerPipeWire> pipewire;
+  if (request.external_stream) {
+    auto portal = std::make_unique<PipeWireStreamPortal>(
+        request.pipewire_fd, request.stream_node_id, request.session_handle);
+    PipeWireStreamPortal* portal_ptr = portal.get();
+    pipewire = std::make_unique<webrtc::BaseCapturerPipeWire>(
+        options_, std::move(portal));
+    portal_ptr->set_notifier(pipewire.get());
+  } else {
+    pipewire = std::make_unique<webrtc::BaseCapturerPipeWire>(
+        options_, request.picker_type);
+    pipewire->Observe(this);
+  }
+
+  // The source id is the key of the portal's restore token: the token of
+  // the pick is stored under it once the user has picked.
+  webrtc::DesktopCapturer::SourceId id = request.restore_id;
+  if (id) {
+    pipewire->SelectSource(id);
+  } else {
+    webrtc::DesktopCapturer::SourceList sources;
+    pipewire->GetSourceList(&sources);
+    if (!sources.empty()) {
+      id = sources.front().id;
+    }
+  }
+  source_ = new RefCountedObject<PipeWireMediaSource>(id, type_);
+
+  pipewire_capturer_ = pipewire.get();
+  std::unique_ptr<webrtc::DesktopCapturer> capturer = std::move(pipewire);
+  if (options_.detect_updated_region()) {
+    capturer =
+        std::make_unique<webrtc::DesktopCapturerDifferWrapper>(
+            std::move(capturer));
+  }
+  capturer_ = std::move(capturer);
+}
+
+void RTCDesktopCapturerImpl::DispatchGLibEvents() {
+  RTC_DCHECK_RUN_ON(thread_.get());
+  if (!glib_context_) {
+    return;
+  }
+  // Bounded, so a flood of events can't starve the capture loop.
+  for (int i = 0; i < 100 && g_main_context_iteration(glib_context_, FALSE);
+       ++i) {
+  }
+}
+
+void RTCDesktopCapturerImpl::DestroyPipeWireCapturer() {
+  RTC_DCHECK_RUN_ON(thread_.get());
+  // Destroying the capturer closes the portal session (or stops watching
+  // the application's) and cancels the portal calls in flight.
+  pipewire_capturer_ = nullptr;
+  capturer_.reset();
+  if (!glib_context_) {
+    return;
+  }
+  // Let the cancelled calls finish on this context for a moment, so their
+  // callbacks run (as no-ops) and release what they hold.
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::milliseconds(100);
+  while (std::chrono::steady_clock::now() < deadline) {
+    if (g_main_context_iteration(glib_context_, FALSE)) {
+      continue;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  g_main_context_pop_thread_default(glib_context_);
+  g_main_context_unref(glib_context_);
+  glib_context_ = nullptr;
+}
+
+void RTCDesktopCapturerImpl::OnSelection() {
+  RTC_DCHECK_RUN_ON(thread_.get());
+  picker_result_ = kPickerSelected;
+  if (observer_) {
+    signaling_thread_->BlockingCall([this]() { observer_->OnStart(this); });
+  }
+}
+
+void RTCDesktopCapturerImpl::OnCancelled() {
+  RTC_DCHECK_RUN_ON(thread_.get());
+  // The next CaptureFrame() reports ERROR_PERMANENT, which calls the
+  // observer's OnError().
+  picker_result_ = kPickerCancelled;
+}
+
+void RTCDesktopCapturerImpl::OnError() {
+  RTC_DCHECK_RUN_ON(thread_.get());
+  picker_result_ = kPickerFailed;
+}
+#endif  // defined(WEBRTC_USE_PIPEWIRE)
+
 RTCDesktopCapturerImpl::~RTCDesktopCapturerImpl() {
+#if defined(WEBRTC_USE_PIPEWIRE)
+  if (glib_context_) {
+    // The portal and its GLib context belong to thread_.
+    thread_->BlockingCall([this] {
+      capture_state_ = CS_STOPPED;
+      DestroyPipeWireCapturer();
+    });
+  }
+#endif
 #ifdef WEBRTC_WIN
   if (com_initializer_) {
     // Release the capturer's WinRT objects, then COM, on the thread that
@@ -253,6 +444,11 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     return capture_state_;
   }
 
+  if (!capturer_) {
+    capture_state_ = CS_FAILED;
+    return capture_state_;
+  }
+
   if (fps == 0) {
     capture_state_ = CS_FAILED;
     return capture_state_;
@@ -283,10 +479,26 @@ RTCDesktopCapturerImpl::CaptureState RTCDesktopCapturerImpl::Start(
     }
   }
 
-  thread_->BlockingCall([this] { capturer_->Start(this); });
+  const bool started = thread_->BlockingCall([this] {
+    // A PipeWire capturer's portal is gone once it was stopped.
+    if (!capturer_) {
+      return false;
+    }
+    capturer_->Start(this);
+#if defined(WEBRTC_USE_PIPEWIRE)
+    DispatchGLibEvents();
+#endif
+    return true;
+  });
+  if (!started) {
+    capture_state_ = CS_FAILED;
+    return capture_state_;
+  }
   capture_state_ = CS_RUNNING;
   thread_->PostTask([this] { CaptureFrame(); });
-  if (observer_) {
+  // A capturer behind the system picker reports OnStart() once the user has
+  // picked a source (OnSelection()).
+  if (observer_ && picker_result_.load() == kPickerNotUsed) {
     signaling_thread_->BlockingCall([&, this]() { observer_->OnStart(this); });
   }
   return capture_state_;
@@ -301,6 +513,21 @@ void RTCDesktopCapturerImpl::Stop() {
     }
   }
   capture_state_ = CS_STOPPED;
+#if defined(WEBRTC_USE_PIPEWIRE)
+  if (glib_context_) {
+    // End the portal session now, so the system's "sharing" indicator goes
+    // away even while this capturer is still referenced. Posted rather than
+    // blocking: Stop() may be called from an observer callback that
+    // thread_ is waiting on. The destructor's blocking call on thread_ runs
+    // after this task.
+    thread_->PostTask([this] {
+      if (capture_state_ == CS_STOPPED) {
+        pipewire_capturer_ = nullptr;
+        capturer_.reset();
+      }
+    });
+  }
+#endif
 }
 
 bool RTCDesktopCapturerImpl::IsRunning() {
@@ -348,7 +575,7 @@ void RTCDesktopCapturerImpl::OnCaptureResult(
     return;
   }
 
-  if (use_wgc_) {
+  if (use_wgc_ || strided_frames_) {
     OnWgcFrame(*frame);
     return;
   }
@@ -423,7 +650,10 @@ void RTCDesktopCapturerImpl::OnWgcFrame(const webrtc::DesktopFrame& frame) {
 
 void RTCDesktopCapturerImpl::CaptureFrame() {
   RTC_DCHECK_RUN_ON(thread_.get());
-  if (capture_state_ == CS_RUNNING) {
+#if defined(WEBRTC_USE_PIPEWIRE)
+  DispatchGLibEvents();
+#endif
+  if (capture_state_ == CS_RUNNING && capturer_) {
     capturer_->CaptureFrame();
     thread_->PostDelayedHighPrecisionTask(
         [this]() { CaptureFrame(); },

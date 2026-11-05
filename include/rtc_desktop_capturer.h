@@ -101,6 +101,30 @@ class RTCDesktopCapturer : public RefCountInterface {
    *        their order.
    */
   virtual bool IsCaptureBorderHidden() = 0;
+
+  /**
+   * @brief Where the system picker stands, for a capturer from
+   *        RTCDesktopDevice::CreateSystemPickerCapturer().
+   */
+  enum SystemPickerResult {
+    /** The capturer doesn't use the system picker. */
+    kPickerNotUsed,
+    /** Start() hasn't been called, or the picker is still open. */
+    kPickerPending,
+    /** The user picked a source. */
+    kPickerSelected,
+    /** The user cancelled the picker. */
+    kPickerCancelled,
+    /** The picker or its session failed. */
+    kPickerFailed,
+  };
+
+  /**
+   * @brief The system picker's outcome so far. Declared after
+   *        IsCaptureBorderHidden() so the existing vtable slots keep their
+   *        order.
+   */
+  virtual SystemPickerResult GetSystemPickerResult() = 0;
 };
 
 /**

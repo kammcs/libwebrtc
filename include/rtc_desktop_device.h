@@ -61,6 +61,61 @@ class RTCDesktopDevice : public RefCountInterface {
       scoped_refptr<MediaSource> source,
       const RTCDesktopCapturerOptions& options) = 0;
 
+  // The methods below are added after the existing ones, so the existing
+  // vtable slots keep their order.
+
+  /**
+   * @brief Whether the system's own picker chooses what is captured.
+   *
+   * True on Linux in a Wayland session with PipeWire, where the
+   * xdg-desktop-portal ScreenCast dialog is the picker and applications
+   * can't list screens or windows themselves. Desktop media lists then hold
+   * one placeholder source per type, without a thumbnail, and opening them
+   * never shows the portal. Use CreateSystemPickerCapturer() to share.
+   * False elsewhere.
+   */
+  virtual bool HasSystemPicker() = 0;
+
+  /**
+   * @brief Creates a capturer whose source the system picker chooses.
+   *
+   * The picker (the ScreenCast portal dialog) opens when Start() is called,
+   * and Start() returns without waiting for it. Once the user picks a
+   * source, the observer's OnStart() is called and frames follow. When the
+   * user cancels, or the portal fails, OnError() is called; then
+   * GetSystemPickerResult() tells which. OnStart() may be called again
+   * later, when frames resume after a pause.
+   *
+   * @param screens, windows Which kinds of sources the picker offers. With
+   *        both, one dialog offers screens and windows.
+   * @param restore_id The source()->id() of an earlier capturer from this
+   *        method, to share the same source again without asking, while the
+   *        application runs (the portal's transient restore token). Empty,
+   *        unknown or expired ids show the picker.
+   * @return nullptr when HasSystemPicker() is false.
+   */
+  virtual scoped_refptr<RTCDesktopCapturer> CreateSystemPickerCapturer(
+      bool screens, bool windows, const string restore_id,
+      const RTCDesktopCapturerOptions& options) = 0;
+
+  /**
+   * @brief Creates a capturer for a PipeWire stream of a portal session that
+   *        the application opened itself.
+   *
+   * For example a RemoteDesktop session that also selected ScreenCast
+   * sources, so the user saw one dialog for control and sharing. No dialog
+   * is shown here. The capturer duplicates `pipewire_fd` (from the
+   * session's OpenPipeWireRemote) and closes its copy when it is destroyed;
+   * the caller keeps its own. When `session_handle` is set, the capturer
+   * watches that session's Closed signal and reports OnError() when it
+   * closes.
+   *
+   * @return nullptr when PipeWire capture isn't available.
+   */
+  virtual scoped_refptr<RTCDesktopCapturer> CreatePipeWireStreamCapturer(
+      int pipewire_fd, uint32_t stream_node_id, const string session_handle,
+      const RTCDesktopCapturerOptions& options) = 0;
+
  protected:
   virtual ~RTCDesktopDevice() {}
 };

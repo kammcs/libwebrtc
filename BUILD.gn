@@ -309,6 +309,13 @@ rtc_shared_library("libwebrtc") {
     if (is_linux) {
       configs += [ ":gio" ]
     }
+    if (is_linux && rtc_use_pipewire) {
+      sources += [
+        "src/internal/pipewire_stream_portal.cc",
+        "src/internal/pipewire_stream_portal.h",
+      ]
+      deps += [ "../modules/portal" ]
+    }
     if(is_mac || is_win || is_linux) {
       deps += [
         "//third_party/libjpeg_turbo:libjpeg",

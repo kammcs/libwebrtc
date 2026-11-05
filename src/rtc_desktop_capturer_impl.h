@@ -17,6 +17,9 @@
 #ifndef LIBWEBRTC_RTC_DESKTOP_CAPTURER_IMPL_HXX
 #define LIBWEBRTC_RTC_DESKTOP_CAPTURER_IMPL_HXX
 
+#include <atomic>
+#include <string>
+
 #include "api/video/i420_buffer.h"
 #include "api/video/video_frame.h"
 #include "include/rtc_desktop_capturer.h"
@@ -30,15 +33,56 @@
 #ifdef WEBRTC_WIN
 #include "rtc_base/win/scoped_com_initializer.h"
 #endif
+#if defined(WEBRTC_USE_PIPEWIRE)
+#include "modules/desktop_capture/delegated_source_list_controller.h"
+#include "modules/desktop_capture/desktop_capture_types.h"
+#endif
 #include "src/internal/vcm_capturer.h"
 #include "src/internal/video_capturer.h"
 
+#if defined(WEBRTC_USE_PIPEWIRE)
+typedef struct _GMainContext GMainContext;
+namespace webrtc {
+class BaseCapturerPipeWire;
+}
+#endif
+
 namespace libwebrtc {
+
+#if defined(WEBRTC_USE_PIPEWIRE)
+// What a PipeWire capturer captures: a source the ScreenCast portal's picker
+// chooses (optionally restored from an earlier pick), or a stream of a
+// portal session the application opened itself.
+struct PipeWireCaptureRequest {
+  // For the picker.
+  webrtc::CaptureType picker_type = webrtc::CaptureType::kAnyScreenContent;
+  // The id of an earlier pick to restore, or 0 to ask.
+  webrtc::DesktopCapturer::SourceId restore_id = 0;
+  // For an application's own session: the stream, instead of the picker.
+  bool external_stream = false;
+  int pipewire_fd = -1;
+  uint32_t stream_node_id = 0;
+  std::string session_handle;
+};
+#endif
 
 class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
                                public webrtc::DesktopCapturer::Callback,
+#if defined(WEBRTC_USE_PIPEWIRE)
+                               public webrtc::DelegatedSourceListController::
+                                   Observer,
+#endif
                                public webrtc::internal::VideoCapturer {
  public:
+#if defined(WEBRTC_USE_PIPEWIRE)
+  // Whether screens and windows are captured through the ScreenCast portal
+  // and PipeWire (a Wayland session with PipeWire available).
+  static bool UsesSystemPicker();
+
+  RTCDesktopCapturerImpl(const PipeWireCaptureRequest& request,
+                         webrtc::Thread* signaling_thread,
+                         const RTCDesktopCapturerOptions& options);
+#endif
   RTCDesktopCapturerImpl(DesktopType type,
                          webrtc::DesktopCapturer::SourceId source_id,
                          webrtc::Thread* signaling_thread,
@@ -69,14 +113,33 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
 
   bool IsCaptureBorderHidden() override { return border_hidden_; }
 
+  SystemPickerResult GetSystemPickerResult() override {
+    return picker_result_.load();
+  }
+
  protected:
   virtual void OnCaptureResult(
       webrtc::DesktopCapturer::Result result,
       std::unique_ptr<webrtc::DesktopFrame> frame) override;
 
  private:
+#if defined(WEBRTC_USE_PIPEWIRE)
+  // DelegatedSourceListController::Observer, called on thread_ while the
+  // thread's GLib main context is iterated.
+  void OnSelection() override;
+  void OnCancelled() override;
+  void OnError() override;
+
+  void CreatePipeWireCapturer(const PipeWireCaptureRequest& request,
+                              bool show_cursor);
+  // Dispatches what is pending on thread_'s GLib main context: the portal's
+  // D-Bus replies and signals. Never blocks.
+  void DispatchGLibEvents();
+  void DestroyPipeWireCapturer();
+#endif
   void CaptureFrame();
-  // Converts a frame from the Windows.Graphics.Capture capturer.
+  // Converts a frame whose rows may be padded (stride > width * 4) and whose
+  // size can differ from the source's (Windows.Graphics.Capture, PipeWire).
   void OnWgcFrame(const webrtc::DesktopFrame& frame);
   webrtc::DesktopCaptureOptions options_;
   std::unique_ptr<webrtc::DesktopCapturer> capturer_;
@@ -101,6 +164,16 @@ class RTCDesktopCapturerImpl : public RTCDesktopCapturer,
   bool use_wgc_ = false;
   // Whether the WGC capture border is off. Set on thread_ in the constructor.
   bool border_hidden_ = false;
+  std::atomic<SystemPickerResult> picker_result_{kPickerNotUsed};
+  // Whether frames need the stride-aware conversion (OnWgcFrame).
+  bool strided_frames_ = false;
+#if defined(WEBRTC_USE_PIPEWIRE)
+  // Set on thread_ in the constructor, for PipeWire capturers only. The
+  // portal's GDBus callbacks are delivered on thread_ through this context,
+  // instead of the process's default context (often the UI thread's).
+  GMainContext* glib_context_ = nullptr;
+  webrtc::BaseCapturerPipeWire* pipewire_capturer_ = nullptr;
+#endif
 #ifdef WEBRTC_WIN
   // WGC needs COM on the thread it runs on. Created and destroyed on thread_.
   std::unique_ptr<webrtc::ScopedCOMInitializer> com_initializer_;
